@@ -1,0 +1,1 @@
+this is the filecontent copy from stdout by tee function!
