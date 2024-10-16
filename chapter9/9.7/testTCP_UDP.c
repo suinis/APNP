@@ -27,6 +27,7 @@ void addfd(int epollfd, int fd){
     event.data.fd = fd;
     event.events = EPOLLIN | EPOLLET;
     epoll_ctl(epollfd, EPOLL_CTL_ADD, fd, &event);
+    setnonblocking(fd);
 }
 
 void listen_func(int epollfd, int listenfd){
@@ -62,7 +63,8 @@ void tcp_func(int tcpfd){
         }else if(recvlen == 0){
             close(tcpfd);
         }else{
-            int sendlen = send(tcpfd, buf, recvlen, 0);
+            snprintf(buf + recvlen, sizeof(buf) - recvlen, "%d\n", tcpfd);
+            int sendlen = send(tcpfd, buf, recvlen + sizeof(tcpfd), 0);
             assert(sendlen != -1);
         }
     }
