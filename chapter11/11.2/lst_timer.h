@@ -169,7 +169,7 @@ void sort_timer_lst::tick()
     /* 接收到SIGALARM信号，遍历定时器链表，执行所有超时事件 */
     while ( tmp )
     {
-        if( tmp->expire > cur) break;
+        if( tmp->expire > cur ) break;
         tmp->cb_func( tmp->user_data );
 
         head = tmp->next;
