@@ -11,7 +11,7 @@
 #include <sys/epoll.h>
 #include <fcntl.h>
 #include <csignal>
-#include <11.2/lst_timer.h>
+#include "lst_timer.h"
 
 // #define __USE_XOPEN_EXTENDED
 #define MAX_EVENT_NUMBER 1024

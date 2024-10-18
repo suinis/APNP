@@ -28,7 +28,6 @@ public:
 
 public:
     util_timer(): prev(nullptr), next(nullptr) {}
-    ~util_timer();
 };
 
 /* 升序双向链表，带有头尾节点 */
