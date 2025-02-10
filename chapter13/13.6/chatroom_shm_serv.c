@@ -5,41 +5,52 @@
 #include <arpa/inet.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <fcntl.h>
 #include <stdbool.h>
 #include <unistd.h>
+#include <signal.h>
 #include <assert.h>
 #include <string.h>
 #include <errno.h>
-#include <signal.h>
+#include <bits/sigaction.h>
 
+#define __USE_POSIX
 #define MAX_EVENT_NUMBER 1024
 #define USER_LIMIT 5
 #define BUFFER_SIZE 1024
+#define MAX_SIGNAL_NUMBER 1024
 #define FD_LIMIT 65536
 
-struct ClientData {
+struct ClientData
+{
     int pipefd[2];
     int connfd;
+    int processid;
 };
 
+char *share_mem = 0;
+static char* shmname = "/myshm";
+int sockfd = 0;
+int epollfd = 0;
 int signal_pipefd[2];
 int user_count = 0;
 int shmfd = 0;
-char* share_mem = 0;
-struct ClientData* users = 0;
+struct ClientData *users = 0;
+int *process_user;
 
-
-int setnonblocking (int fd) {
+int setnonblocking(int fd)
+{
     int old_option = fcntl(fd, F_GETFL);
     int new_option = old_option | O_NONBLOCK;
     fcntl(fd, F_SETFL, new_option);
     return old_option;
 }
 
-void addfd (int epollfd, int fd) {
+void addfd(int epollfd, int fd)
+{
     struct epoll_event event;
     event.data.fd = fd;
     event.events = EPOLLIN | EPOLLET;
@@ -47,11 +58,105 @@ void addfd (int epollfd, int fd) {
     setnonblocking(fd);
 }
 
-int main (int argc, char* argv[]) {
-    const char* ip = argv[1];
+void handler(int sig)
+{
+    int save_errno = errno;
+    int msg = sig;
+    send(signal_pipefd[1], &msg, 1, 0);
+    errno = save_errno;
+}
+
+void addsig(int sig, void(*handler)(int), bool restart = true) 
+{
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handler;
+    if(restart) 
+    {
+        sa.sa_flags |= SA_RESTART;
+    }
+    sigfillset(&sa.sa_mask);
+    assert(sigaction(sig, &sa, NULL) != -1);
+}
+
+void del_resource()
+{
+    close(signal_pipefd[0]);
+    close(signal_pipefd[1]);
+    close(sockfd);
+    close(epollfd);
+    shm_unlink(shmname);
+    free(users);
+}
+
+void run_child(int user_count, struct ClientData *users, void *share_mem)
+{
+    bool stop_child = false;
+    struct epoll_event events[MAX_EVENT_NUMBER];
+
+    int child_epollfd = epoll_create(5);
+    assert(child_epollfd != -1);
+    int connfd = users[user_count].connfd;
+    int pipefd = users[user_count].pipefd[1];
+    addfd(child_epollfd, connfd);
+    addfd(child_epollfd, pipefd);
+
+    while (!stop_child)
+    {
+        int num = epoll_wait(child_epollfd, events, MAX_EVENT_NUMBER, -1);
+        for (int i = 0; i < num; ++i)
+        {
+            int sockfd = events[i].data.fd;
+            if (sockfd == connfd && (events[i].events & EPOLLIN))
+            { // 接收客户端消息到共享内存
+                void *buf = share_mem + user_count * BUFFER_SIZE;
+                memset(buf, '\0', BUFFER_SIZE);
+                int ret = recv(connfd, buf, BUFFER_SIZE - 1, 0);
+
+                if (ret < 0 && errno != EAGAIN)
+                {
+                    stop_child = true;
+                }
+                else if (ret)
+                {
+                    stop_child = true;
+                }
+                else
+                {
+                    send(pipefd, (char *)&user_count, sizeof(user_count), 0);
+                }
+            }
+            else if (sockfd == pipefd && (events[i].events & EPOLLIN))
+            { // 主进程通知本进程有消息到共享内存
+                int client = 0;
+                int ret = recv(pipefd, (char *)&client, sizeof(client), 0);
+                if (ret < 0 && errno != EAGAIN)
+                {
+                    continue;
+                }
+                else if (ret == 0)
+                {
+                    continue;
+                }
+                else
+                {
+                    send(connfd, share_mem + client * BUFFER_SIZE, BUFFER_SIZE, 0);
+                }
+            }
+        }
+    }
+    close(connfd);
+    close(pipefd);
+    close(child_epollfd);
+}
+
+int main(int argc, char *argv[])
+{
+    bool stop_server = false;
+    const char *ip = argv[1];
     const int port = atoi(argv[2]);
 
-    int sockfd = socket(PF_INET, SOCK_STREAM, 0);
+    sockfd = socket(PF_INET, SOCK_STREAM, 0);
     assert(sockfd >= 0);
 
     struct sockaddr_in servaddr;
@@ -59,13 +164,13 @@ int main (int argc, char* argv[]) {
     servaddr.sin_port = htons(port);
     inet_pton(AF_INET, ip, &servaddr.sin_addr);
 
-    int ret = bind(sockfd, (struct sockaddr*)&servaddr, sizeof(servaddr));
+    int ret = bind(sockfd, (struct sockaddr *)&servaddr, sizeof(servaddr));
     assert(ret != -1);
 
     ret = listen(sockfd, 5);
     assert(ret != -1);
 
-    int epollfd = epoll_create(5);
+    epollfd = epoll_create(5);
     assert(epollfd != -1);
     struct epoll_event events[MAX_EVENT_NUMBER];
 
@@ -75,7 +180,12 @@ int main (int argc, char* argv[]) {
     setnonblocking(signal_pipefd[1]);
     addfd(epollfd, signal_pipefd[0]);
 
-    shmfd = shm_open(NULL, O_CREAT | O_RDWR, 0666);   // 创建共享内存对象
+    addsig(SIGCHLD, handler);
+    addsig(SIGTERM, handler);
+    addsig(SIGINT, handler);
+    addsig(SIGPIPE, SIG_IGN);
+
+    shmfd = shm_open(shmname, O_CREAT | O_RDWR, 0666); // 创建共享内存对象
     assert(shmfd != -1);
     ret = ftruncate(shmfd, USER_LIMIT * BUFFER_SIZE); // 为共享内存分配空间
     assert(ret != -1);
@@ -83,66 +193,158 @@ int main (int argc, char* argv[]) {
     assert(share_mem != MAP_FAILED);
 
     users = malloc(sizeof(struct ClientData) * USER_LIMIT);
+    process_user = malloc(sizeof(int) * USER_LIMIT);
 
-    while (1)
+    while (!stop_server)
     {
         int num = epoll_wait(epollfd, events, MAX_EVENT_NUMBER, -1);
-        if (num < 0) {
+        if (num < 0)
+        {
             printf("epoll failure\n");
             break;
         }
         for (int i = 0; i < num; ++i)
         {
             int cur_sockfd = events[i].data.fd;
-            if (cur_sockfd == sockfd) {
+            if (cur_sockfd == sockfd)
+            {
                 struct sockaddr_in clientaddr;
                 socklen_t clientaddr_len = sizeof(clientaddr);
-                int connfd = accept(sockfd, (struct sockaddr*)&clientaddr, &clientaddr_len);
-                if (connfd < 0) {
+                int connfd = accept(sockfd, (struct sockaddr *)&clientaddr, &clientaddr_len);
+                if (connfd < 0)
+                {
                     printf("errno is: %d\n", errno);
                     continue;
                 }
-                if (user_count >= USER_LIMIT) {
-                    const char* info = "too many users\n";
+                if (user_count >= USER_LIMIT)
+                {
+                    const char *info = "too many users\n";
                     printf("%s", info);
                     send(connfd, info, strlen(info), 0);
                     close(connfd);
                     continue;
                 }
 
-                users[user_count].connfd = connfd;
                 ret = socketpair(PF_UNIX, SOCK_STREAM, 0, users[user_count].pipefd);
+                users[user_count].connfd = connfd;
                 assert(ret != -1);
 
                 pid_t pid = fork();
-                if (pid < 0) {
+                if (pid < 0)
+                {
                     close(connfd);
                     continue;
                 }
-                else if (pid == 0) {
+                else if (pid == 0)
+                {
                     close(sockfd);
                     close(epollfd);
                     close(signal_pipefd[0]);
                     close(signal_pipefd[1]);
                     close(users[user_count].pipefd[0]);
-                    addfd(epollfd, connfd);
-                    
+                    run_child(user_count, users, share_mem);
+                    munmap((void *)share_mem, USER_LIMIT * BUFFER_SIZE);
+                    exit(0);
                 }
-                else {
+                else
+                {
                     close(connfd);
                     close(users[user_count].pipefd[1]);
+                    addfd(epollfd, users[user_count].pipefd[0]);
+                    users[user_count].processid = pid;
+                    process_user[pid] = user_count;
+                    ++user_count;
                 }
-            } 
-            else if () {
-
             }
-            else if () {
-
+            else if (cur_sockfd == signal_pipefd[0] && (events[i].events & EPOLLIN))
+            {
+                int sig;
+                char signals[MAX_SIGNAL_NUMBER]; // 信号处理为异步执行，管道通信是数据流，且没有数据边界，所以定义一个缓冲区一次性接收所有信号
+                ret = recv(signal_pipefd[0], (char*)& sig, sizeof(sig), 0);
+                if(ret < 0) 
+                {
+                    continue;
+                }
+                else if(ret == 0)
+                {
+                    continue;
+                }
+                else 
+                {
+                    for(int j = 0; j < ret; ++j)
+                    {
+                        switch (signals[j])
+                        {
+                        case SIGCHLD: //子进程因为客户端断开连接而退出
+                        {
+                            pid_t pid;
+                            int stat;
+                            while (pid = waitpid(-1, &stat, WNOHANG) > 0)
+                            {
+                                int del_user = process_user[pid];
+                                process_user[pid] = -1; 
+                                if (del_user < 0 || del_user >= USER_LIMIT)
+                                {
+                                    continue;
+                                }
+                                epoll_ctl(epollfd, EPOLL_CTL_DEL, users[del_user].pipefd[0], 0);
+                                close(users[del_user].pipefd[0]);
+                                users[del_user] = users[--user_count];
+                                process_user[users[del_user].processid] = del_user;
+                            }
+                            break;
+                        }
+                        case SIGTERM:
+                        case SIGINT:
+                        {
+                            printf("kill all the child now\n");
+                            if(user_count == 0)
+                            {
+                                stop_server = true;
+                                break;
+                            }
+                            for(int j = 0; j < user_count; ++j)
+                            {
+                                int pid = users[j].processid;
+                                kill(pid, SIGTERM);
+                                
+                            }
+                        }
+                        default:
+                            break;
+                        }
+                    }
+                }
+            }
+            else if (events[i].events & EPOLLIN)
+            {
+                int child = 0;
+                ret = recv(cur_sockfd, (char *)&child, sizeof(child), 0);
+                printf("read data from child accross pipe\n");
+                if (ret < 0)
+                {
+                    continue;
+                }
+                else if (ret == 0)
+                {
+                    continue;
+                }
+                else
+                {
+                    for (int j = 0; j < user_count; ++j)
+                    {
+                        if (users[j].connfd != child)
+                        {
+                            printf("send data to child accross pipe\n");
+                            send(users[j].pipefd[1], (char *)&child, sizeof(child), 0);
+                        }
+                    }
+                }
             }
         }
-        
     }
 
-    //close
-    return 0; 
+    // close
+    del_resource();
+    return 0;
 }
