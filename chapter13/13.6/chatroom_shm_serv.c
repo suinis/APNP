@@ -1,14 +1,17 @@
+/* 编译时需要加上链接库： -lrt */
+
 #include <sys/types.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <sys/mman.h>
+#include <sys/mman.h> // 共享内存核心函数声明，同下面两个头文件（调用shm_open, shm_unlink,以及涉及文件控制选项以及权限设置）
+#include <sys/stat.h> // 文件模式宏（如权限 S_IRUSR、S_IWUSR）
+#include <fcntl.h>    // 文件控制选项（如 O_CREAT、O_RDWR）
 #include <sys/wait.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <fcntl.h>
 #include <stdbool.h>
 #include <unistd.h>
 #include <signal.h>
@@ -17,12 +20,12 @@
 #include <errno.h>
 #include <bits/sigaction.h>
 
-#define __USE_POSIX
 #define MAX_EVENT_NUMBER 1024
 #define USER_LIMIT 5
 #define BUFFER_SIZE 1024
 #define MAX_SIGNAL_NUMBER 1024
 #define FD_LIMIT 65536
+#define PROCESS_LIMIT 4194304
 
 struct ClientData
 {
@@ -32,7 +35,7 @@ struct ClientData
 };
 
 char *share_mem = 0;
-static char* shmname = "/myshm";
+static char* shmname = "/myshm"; // 共享内存对象名命名规则：必须以'/'开头，且中间不能有'/'，长度不能超过NAME_MAX（通常是255）
 int sockfd = 0;
 int epollfd = 0;
 int signal_pipefd[2];
@@ -66,7 +69,7 @@ void handler(int sig)
     errno = save_errno;
 }
 
-void addsig(int sig, void(*handler)(int), bool restart = true) 
+void addsig(int sig, void(*handler)(int), bool restart) 
 {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -85,7 +88,7 @@ void del_resource()
     close(signal_pipefd[1]);
     close(sockfd);
     close(epollfd);
-    shm_unlink(shmname);
+    shm_unlink(shmname); // 即使进程崩溃，共享内存对象仍会保留，需显式调用 shm_unlink 删除。
     free(users);
 }
 
@@ -153,6 +156,7 @@ void run_child(int user_count, struct ClientData *users, void *share_mem)
 int main(int argc, char *argv[])
 {
     bool stop_server = false;
+    bool terminate = false;
     const char *ip = argv[1];
     const int port = atoi(argv[2]);
 
@@ -180,10 +184,10 @@ int main(int argc, char *argv[])
     setnonblocking(signal_pipefd[1]);
     addfd(epollfd, signal_pipefd[0]);
 
-    addsig(SIGCHLD, handler);
-    addsig(SIGTERM, handler);
-    addsig(SIGINT, handler);
-    addsig(SIGPIPE, SIG_IGN);
+    addsig(SIGCHLD, handler, true);
+    addsig(SIGTERM, handler, true);
+    addsig(SIGINT, handler, true);
+    addsig(SIGPIPE, SIG_IGN, true);
 
     shmfd = shm_open(shmname, O_CREAT | O_RDWR, 0666); // 创建共享内存对象
     assert(shmfd != -1);
@@ -193,7 +197,11 @@ int main(int argc, char *argv[])
     assert(share_mem != MAP_FAILED);
 
     users = malloc(sizeof(struct ClientData) * USER_LIMIT);
-    process_user = malloc(sizeof(int) * USER_LIMIT);
+    process_user = malloc(sizeof(int) * PROCESS_LIMIT);
+    for(int i = 0; i < PROCESS_LIMIT; ++i)
+    {
+        process_user[i] = -1;
+    }
 
     while (!stop_server)
     {
@@ -252,6 +260,7 @@ int main(int argc, char *argv[])
                     close(users[user_count].pipefd[1]);
                     addfd(epollfd, users[user_count].pipefd[0]);
                     users[user_count].processid = pid;
+                    printf("child pid: %d\n", pid);
                     process_user[pid] = user_count;
                     ++user_count;
                 }
@@ -292,6 +301,10 @@ int main(int argc, char *argv[])
                                 users[del_user] = users[--user_count];
                                 process_user[users[del_user].processid] = del_user;
                             }
+                            if(terminate && user_count == 0)
+                            {
+                                stop_server = true;
+                            }
                             break;
                         }
                         case SIGTERM:
@@ -307,8 +320,9 @@ int main(int argc, char *argv[])
                             {
                                 int pid = users[j].processid;
                                 kill(pid, SIGTERM);
-                                
                             }
+                            terminate = true;
+                            break;
                         }
                         default:
                             break;
