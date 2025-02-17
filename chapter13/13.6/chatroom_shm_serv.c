@@ -334,7 +334,7 @@ int main(int argc, char *argv[])
             {
                 int child = 0;
                 ret = recv(cur_sockfd, (char *)&child, sizeof(child), 0);
-                printf("read data from child accross pipe\n");
+                printf("read data from child across pipe\n");
                 if (ret < 0)
                 {
                     continue;
@@ -350,7 +350,7 @@ int main(int argc, char *argv[])
                         if (users[j].connfd != child)
                         {
                             printf("send data to child accross pipe\n");
-                            send(users[j].pipefd[1], (char *)&child, sizeof(child), 0);
+                            send(users[j].pipefd[0], (char *)&child, sizeof(child), 0);
                         }
                     }
                 }
