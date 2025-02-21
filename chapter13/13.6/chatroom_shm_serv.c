@@ -13,11 +13,11 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
-#include <unistd.h>
 #include <signal.h>
+#include <unistd.h>
 #include <assert.h>
-#include <string.h>
 #include <errno.h>
+#include <string.h>
 #include <bits/sigaction.h>
 
 #define MAX_EVENT_NUMBER 1024
@@ -34,6 +34,7 @@ struct ClientData
     int processid;
 };
 
+bool stop_child = false;
 char *share_mem = 0;
 static char* shmname = "/myshm"; // 共享内存对象名命名规则：必须以'/'开头，且中间不能有'/'，长度不能超过NAME_MAX（通常是255）
 int sockfd = 0;
@@ -69,6 +70,11 @@ void handler(int sig)
     errno = save_errno;
 }
 
+void child_term_handler(int sig)
+{
+    stop_child = true;
+}
+
 void addsig(int sig, void(*handler)(int), bool restart) 
 {
     struct sigaction sa;
@@ -90,11 +96,11 @@ void del_resource()
     close(epollfd);
     shm_unlink(shmname); // 即使进程崩溃，共享内存对象仍会保留，需显式调用 shm_unlink 删除。
     free(users);
+    free(process_user);
 }
 
 void run_child(int user_count, struct ClientData *users, void *share_mem)
 {
-    bool stop_child = false;
     struct epoll_event events[MAX_EVENT_NUMBER];
 
     int child_epollfd = epoll_create(5);
@@ -103,6 +109,8 @@ void run_child(int user_count, struct ClientData *users, void *share_mem)
     int pipefd = users[user_count].pipefd[1];
     addfd(child_epollfd, connfd);
     addfd(child_epollfd, pipefd);
+
+    addsig(SIGTERM, child_term_handler, false);
 
     while (!stop_child)
     {
@@ -126,6 +134,7 @@ void run_child(int user_count, struct ClientData *users, void *share_mem)
                 }
                 else
                 {
+                    printf("recv data from client%d: %s\n", connfd, (char *)buf);
                     send(pipefd, (char *)&user_count, sizeof(user_count), 0);
                 }
             }
@@ -155,6 +164,12 @@ void run_child(int user_count, struct ClientData *users, void *share_mem)
 
 int main(int argc, char *argv[])
 {
+    if(argc <= 2)
+    {
+        printf("usage: %s ip_address port_number\n", basename(argv[0]));
+        return 1;
+    }
+
     bool stop_server = false;
     bool terminate = false;
     const char *ip = argv[1];
@@ -193,8 +208,9 @@ int main(int argc, char *argv[])
     assert(shmfd != -1);
     ret = ftruncate(shmfd, USER_LIMIT * BUFFER_SIZE); // 为共享内存分配空间
     assert(ret != -1);
-    share_mem = mmap(NULL, USER_LIMIT * BUFFER_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, shmfd, 0); // 将共享内存对象映射到mmap指定地址
+    share_mem = (char*)mmap(NULL, USER_LIMIT * BUFFER_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, shmfd, 0); // 将共享内存对象映射到mmap指定地址
     assert(share_mem != MAP_FAILED);
+    close(shmfd);
 
     users = malloc(sizeof(struct ClientData) * USER_LIMIT);
     process_user = malloc(sizeof(int) * PROCESS_LIMIT);
@@ -206,9 +222,9 @@ int main(int argc, char *argv[])
     while (!stop_server)
     {
         int num = epoll_wait(epollfd, events, MAX_EVENT_NUMBER, -1);
-        if (num < 0)
+        if (num < 0 && errno != EINTR)
         {
-            printf("epoll failure\n");
+            printf("epoll failure, errno : %d\n", errno);
             break;
         }
         for (int i = 0; i < num; ++i)
@@ -234,12 +250,13 @@ int main(int argc, char *argv[])
                 }
 
                 ret = socketpair(PF_UNIX, SOCK_STREAM, 0, users[user_count].pipefd);
-                users[user_count].connfd = connfd;
                 assert(ret != -1);
+                users[user_count].connfd = connfd;                
 
                 pid_t pid = fork();
                 if (pid < 0)
                 {
+                    perror("fork() error!\n");
                     close(connfd);
                     continue;
                 }
@@ -269,7 +286,8 @@ int main(int argc, char *argv[])
             {
                 int sig;
                 char signals[MAX_SIGNAL_NUMBER]; // 信号处理为异步执行，管道通信是数据流，且没有数据边界，所以定义一个缓冲区一次性接收所有信号
-                ret = recv(signal_pipefd[0], (char*)& sig, sizeof(sig), 0);
+                ret = recv(signal_pipefd[0], signals, sizeof(signals), 0);
+                printf("recv signal from signal_pipefd[0]\n");
                 if(ret < 0) 
                 {
                     continue;
@@ -316,12 +334,19 @@ int main(int argc, char *argv[])
                                 stop_server = true;
                                 break;
                             }
-                            for(int j = 0; j < user_count; ++j)
+                            for(int j = user_count - 1; j >= 0; --j)
                             {
                                 int pid = users[j].processid;
-                                kill(pid, SIGTERM);
+                                if (kill(pid, SIGTERM) == -1) {
+                                    perror("Failed to send SIGTERM");
+                                    continue;
+                                }
+                                process_user[pid] = -1;
+                                epoll_ctl(epollfd, EPOLL_CTL_DEL, users[j].pipefd[0], 0);
+                                --user_count;
                             }
-                            terminate = true;
+                            printf("still have %d child alive\n", user_count);
+                            terminate = true; // ???
                             break;
                         }
                         default:
@@ -330,11 +355,11 @@ int main(int argc, char *argv[])
                     }
                 }
             }
-            else if (events[i].events & EPOLLIN)
+            else if (events[i].events & EPOLLIN) // 子进程的管道有数据输入
             {
-                int child = 0;
-                ret = recv(cur_sockfd, (char *)&child, sizeof(child), 0);
-                printf("read data from child across pipe\n");
+                int conn_seq = 0;
+                ret = recv(cur_sockfd, (char *)&conn_seq, sizeof(conn_seq), 0); // 注意：接收到的是客户连接的序号
+                printf("read data from child across pipe, conn_seq: %d\n", conn_seq);
                 if (ret < 0)
                 {
                     continue;
@@ -347,10 +372,10 @@ int main(int argc, char *argv[])
                 {
                     for (int j = 0; j < user_count; ++j)
                     {
-                        if (users[j].connfd != child)
+                        if (users[j].pipefd[0] != cur_sockfd) // 不是自己的管道
                         {
                             printf("send data to child accross pipe\n");
-                            send(users[j].pipefd[0], (char *)&child, sizeof(child), 0);
+                            send(users[j].pipefd[0], (char *)&conn_seq, sizeof(conn_seq), 0);
                         }
                     }
                 }
