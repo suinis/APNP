@@ -1,4 +1,8 @@
 /* 编译时需要加上链接库： -lrt */
+/* to do:
+   运行有问题：服务端主进程执行epoll_wait过程中，客户端同服务端建立连接成功后，
+   发送消息会导致服务端主进程epoll_wait失败（因为接收到了EINTR信号）而无法正常通信。
+目前没发现解决方案 */
 
 #include <sys/types.h>
 #include <sys/epoll.h>
@@ -36,7 +40,7 @@ struct ClientData
 
 bool stop_child = false;
 char *share_mem = 0;
-static char* shmname = "/myshm"; // 共享内存对象名命名规则：必须以'/'开头，且中间不能有'/'，长度不能超过NAME_MAX（通常是255）
+static char *shmname = "/myshm"; // 共享内存对象名命名规则：必须以'/'开头，且中间不能有'/'，长度不能超过NAME_MAX（通常是255）
 int sockfd = 0;
 int epollfd = 0;
 int signal_pipefd[2];
@@ -66,7 +70,7 @@ void handler(int sig)
 {
     int save_errno = errno;
     int msg = sig;
-    send(signal_pipefd[1], &msg, 1, 0);
+    send(signal_pipefd[1], (char*) &msg, 1, 0);
     errno = save_errno;
 }
 
@@ -75,12 +79,12 @@ void child_term_handler(int sig)
     stop_child = true;
 }
 
-void addsig(int sig, void(*handler)(int), bool restart) 
+void addsig(int sig, void (*handler)(int), bool restart)
 {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = handler;
-    if(restart) 
+    if (restart)
     {
         sa.sa_flags |= SA_RESTART;
     }
@@ -164,7 +168,7 @@ void run_child(int user_count, struct ClientData *users, void *share_mem)
 
 int main(int argc, char *argv[])
 {
-    if(argc <= 2)
+    if (argc <= 2)
     {
         printf("usage: %s ip_address port_number\n", basename(argv[0]));
         return 1;
@@ -208,13 +212,13 @@ int main(int argc, char *argv[])
     assert(shmfd != -1);
     ret = ftruncate(shmfd, USER_LIMIT * BUFFER_SIZE); // 为共享内存分配空间
     assert(ret != -1);
-    share_mem = (char*)mmap(NULL, USER_LIMIT * BUFFER_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, shmfd, 0); // 将共享内存对象映射到mmap指定地址
+    share_mem = (char *)mmap(NULL, USER_LIMIT * BUFFER_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, shmfd, 0); // 将共享内存对象映射到mmap指定地址
     assert(share_mem != MAP_FAILED);
     close(shmfd);
 
     users = malloc(sizeof(struct ClientData) * USER_LIMIT);
     process_user = malloc(sizeof(int) * PROCESS_LIMIT);
-    for(int i = 0; i < PROCESS_LIMIT; ++i)
+    for (int i = 0; i < PROCESS_LIMIT; ++i)
     {
         process_user[i] = -1;
     }
@@ -251,7 +255,7 @@ int main(int argc, char *argv[])
 
                 ret = socketpair(PF_UNIX, SOCK_STREAM, 0, users[user_count].pipefd);
                 assert(ret != -1);
-                users[user_count].connfd = connfd;                
+                users[user_count].connfd = connfd;
 
                 pid_t pid = fork();
                 if (pid < 0)
@@ -288,28 +292,28 @@ int main(int argc, char *argv[])
                 char signals[MAX_SIGNAL_NUMBER]; // 信号处理为异步执行，管道通信是数据流，且没有数据边界，所以定义一个缓冲区一次性接收所有信号
                 ret = recv(signal_pipefd[0], signals, sizeof(signals), 0);
                 printf("recv signal from signal_pipefd[0]\n");
-                if(ret < 0) 
+                if (ret < 0)
                 {
                     continue;
                 }
-                else if(ret == 0)
+                else if (ret == 0)
                 {
                     continue;
                 }
-                else 
+                else
                 {
-                    for(int j = 0; j < ret; ++j)
+                    for (int j = 0; j < ret; ++j)
                     {
                         switch (signals[j])
                         {
-                        case SIGCHLD: //子进程因为客户端断开连接而退出
+                        case SIGCHLD: // 子进程因为客户端断开连接而退出
                         {
                             pid_t pid;
                             int stat;
                             while (pid = waitpid(-1, &stat, WNOHANG) > 0)
                             {
                                 int del_user = process_user[pid];
-                                process_user[pid] = -1; 
+                                process_user[pid] = -1;
                                 if (del_user < 0 || del_user >= USER_LIMIT)
                                 {
                                     continue;
@@ -319,7 +323,7 @@ int main(int argc, char *argv[])
                                 users[del_user] = users[--user_count];
                                 process_user[users[del_user].processid] = del_user;
                             }
-                            if(terminate && user_count == 0)
+                            if (terminate && user_count == 0)
                             {
                                 stop_server = true;
                             }
@@ -329,15 +333,16 @@ int main(int argc, char *argv[])
                         case SIGINT:
                         {
                             printf("kill all the child now\n");
-                            if(user_count == 0)
+                            if (user_count == 0)
                             {
                                 stop_server = true;
                                 break;
                             }
-                            for(int j = user_count - 1; j >= 0; --j)
+                            for (int j = user_count - 1; j >= 0; --j)
                             {
                                 int pid = users[j].processid;
-                                if (kill(pid, SIGTERM) == -1) {
+                                if (kill(pid, SIGTERM) == -1)
+                                {
                                     perror("Failed to send SIGTERM");
                                     continue;
                                 }
