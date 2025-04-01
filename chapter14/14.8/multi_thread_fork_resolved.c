@@ -41,7 +41,7 @@ int main() {
     sleep(1); // ensure child thread has acquired the mutex
 
     pthread_atfork(prepare, parent, child);
-    int pid = fork();
+    int pid = fork(); //子进程只会复制调用fork函数的线程（线程中调用fork不会复制出与主进程相同的线程数，只会复制调用fork的那个线程）
     if ( pid < 0 ) {
         pthread_mutex_destroy(&mutex);
         pthread_join(tid, NULL);
